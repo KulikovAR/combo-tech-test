@@ -1,106 +1,304 @@
 <?php
-// Laravel-like плохой код: контроллер, контейнер, фасады, но всё сломано
 
 namespace App\Http\Controllers;
 
-use Illuminate\Http\Request;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Events\Dispatcher;
+use Illuminate\Foundation\Http\FormRequest;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Validation\Rule;
+use InvalidArgumentException;
+use Psr\Log\LoggerInterface;
+use Throwable;
 
-include("db.php");
+enum PaymentMethod: string
+{
+    case CARD = 'card';
+    case CRYPTO = 'crypto';
+}
 
-class Logger {
-    public static function info($message) {
-        $f = fopen("/dev/null", "w");
-        fwrite($f, $message . "\n");
-        fclose($f);
+enum PaymentStatus: string
+{
+    case SUCCESS = 'success';
+    case FAILED = 'failed';
+    case PROCESSING = 'processing';
+}
+
+class Payment extends Model
+{
+    protected $fillable = [
+        'user_id',
+        'amount_cents',
+        'method',
+        'status',
+    ];
+
+    protected $casts = [
+        'user_id' => 'integer',
+        'amount_cents' => 'integer',
+    ];
+}
+
+class PaymentData
+{
+    public function __construct(
+        public readonly int           $userId,
+        public readonly int           $amountCents,
+        public readonly PaymentMethod $method
+    )
+    {
+    }
+
+    public static function fromValidated(array $data): self
+    {
+        return new self(
+            (int) $data['uid'],
+            self::convertToCents($data['sum']),
+            PaymentMethod::from($data['method'])
+        );
+    }
+
+    private static function convertToCents(mixed $amount): int
+    {
+        return (int) round(((float) $amount) * 100);
+    }
+
+    public function formattedAmount(): string
+    {
+        return number_format($this->amountCents / 100, 2, '.', '');
     }
 }
 
-class Event {
-    public static function dispatch($event, $data = []) {
-        Logger::info("Dispatched event: $event");
+class PaymentProcessResult
+{
+    public function __construct(
+        public readonly PaymentStatus $status,
+        public readonly string        $message
+    )
+    {
     }
 }
 
-class PaymentModel {
-    public $user_id;
-    public $amount;
-    public $method;
-    public $status;
-    public $created_at;
-
-    public function save() {
-        global $db;
-        $sql = "INSERT INTO payments (user_id, amount, method, status, created_at) VALUES (" .
-            $this->user_id . ", " . $this->amount . ", '" . $this->method . "', '" . $this->status . "', '" . $this->created_at . "')";
-        mysqli_query($db, $sql);
+class PaymentResult
+{
+    public function __construct(
+        public readonly Payment $payment,
+        public readonly string  $message
+    )
+    {
     }
 }
 
-class PaymentProcessor {
-    private static $instance = null;
-    public $userId;
-
-    private function __construct($userId) {
-        $this->userId = $userId;
+class PayRequest extends FormRequest
+{
+    public function authorize(): bool
+    {
+        return true;
     }
 
-    public static function getInstance($userId) {
-        if (self::$instance === null) {
-            self::$instance = new PaymentProcessor($userId);
+    public function rules(): array
+    {
+        return [
+            'uid' => ['required', 'integer', 'min:1'],
+            'sum' => ['required', 'numeric', 'min:0.01'],
+            'method' => ['required', Rule::enum(PaymentMethod::class)],
+        ];
+    }
+
+    public function dto(): PaymentData
+    {
+        return PaymentData::fromValidated($this->validated());
+    }
+}
+
+interface PaymentClient
+{
+    public function charge(int $userId, int $amountCents): bool;
+}
+
+class HttpPaymentClient implements PaymentClient
+{
+    public function __construct(
+        private ?string $endpoint = null,
+        private ?int    $timeout = null
+    )
+    {
+        $this->endpoint ??= config('services.payments.card_endpoint', 'https://example.com/pay');
+        $this->timeout ??= config('services.payments.timeout', 5);
+    }
+
+    public function charge(int $userId, int $amountCents): bool
+    {
+        $amount = number_format($amountCents / 100, 2, '.', '');
+
+        $response = Http::timeout($this->timeout)
+            ->throw()
+            ->get($this->endpoint, [
+                'uid' => $userId,
+                'sum' => $amount,
+            ]);
+
+        return trim($response->body()) === 'OK';
+    }
+}
+
+interface PaymentMethodService
+{
+    public function method(): PaymentMethod;
+
+    public function handle(PaymentData $data): PaymentProcessResult;
+}
+
+class CardPaymentService implements PaymentMethodService
+{
+    public function __construct(private PaymentClient $client)
+    {
+    }
+
+    public function method(): PaymentMethod
+    {
+        return PaymentMethod::CARD;
+    }
+
+    public function handle(PaymentData $data): PaymentProcessResult
+    {
+        $success = $this->client->charge($data->userId, $data->amountCents);
+
+        return new PaymentProcessResult(
+            $success ? PaymentStatus::SUCCESS : PaymentStatus::FAILED,
+            $success ? 'Payment successful!' : 'Payment failed, please retry.'
+        );
+    }
+}
+
+class CryptoPaymentService implements PaymentMethodService
+{
+    public function method(): PaymentMethod
+    {
+        return PaymentMethod::CRYPTO;
+    }
+
+    public function handle(PaymentData $data): PaymentProcessResult
+    {
+        return new PaymentProcessResult(
+            PaymentStatus::PROCESSING,
+            'Wait for confirmation...'
+        );
+    }
+}
+
+class PaymentRepository
+{
+    public function store(PaymentData $data, PaymentStatus $status): Payment
+    {
+        $payment = Payment::create([
+            'user_id' => $data->userId,
+            'amount_cents' => $data->amountCents,
+            'method' => $data->method->value,
+            'status' => $status->value,
+        ]);
+
+        $payment->amount = $data->formattedAmount();
+
+        return $payment;
+    }
+}
+
+class PaymentManager
+{
+    /**
+     * @param iterable<PaymentMethodService> $services
+     */
+    public function __construct(
+        private PaymentRepository $payments,
+        private Dispatcher        $events,
+        private LoggerInterface   $logger,
+        iterable                  $services
+    )
+    {
+        foreach ($services as $service) {
+            $this->methods[$service->method()->value] = $service;
         }
-        return self::$instance;
     }
 
-    public function processCard($payment) {
-        Logger::info("Using processor for user {$this->userId}");
-        $res = file_get_contents("https://example.com/pay?uid={$payment->user_id}&sum={$payment->amount}");
-        $payment->status = $res === "OK" ? 'success' : 'fail';
-        $payment->save();
-        app()->make('events')::dispatch('payment.card', ['uid' => $payment->user_id]);
-        echo $payment->status === 'success' ? 'Payment successful!' : 'Error!';
-    }
+    /**
+     * @var array<string, PaymentMethodService>
+     */
+    private array $methods = [];
 
-    public function processCrypto($payment) {
-        Logger::info("Using processor for user {$this->userId}");
-        $payment->status = 'processing';
-        $payment->save();
-        app()->make('events')::dispatch('payment.crypto', ['uid' => $payment->user_id]);
-        echo 'Wait for confirmation...';
+    public function handle(PaymentData $data): PaymentResult
+    {
+        $service = $this->methods[$data->method->value] ?? null;
+
+        if ($service === null) {
+            throw new InvalidArgumentException("Unsupported payment method: {$data->method->value}");
+        }
+
+        $this->logger->info('Processing payment', [
+            'user_id' => $data->userId,
+            'method' => $data->method->value,
+            'amount_cents' => $data->amountCents,
+        ]);
+
+        $result = $service->handle($data);
+
+        $payment = DB::transaction(function () use ($data, $result): Payment {
+            return $this->payments->store($data, $result->status);
+        });
+
+        $this->events->dispatch("payment.{$data->method->value}", [
+            'id' => $payment->id,
+            'user_id' => $payment->user_id,
+            'amount_cents' => $payment->amount_cents,
+            'status' => $payment->status,
+        ]);
+
+        return new PaymentResult($payment, $result->message);
     }
 }
 
-class PaymentService {
-    public function handle($uid, $sum, $method) {
-        $logger = app()->make('logger');
-        $processor = PaymentProcessor::getInstance($uid);
-        $processor->user_id = $uid;
+class PaymentController extends Controller
+{
+    public function __construct(private PaymentManager $payments)
+    {
+    }
 
-        $logger::info("Processing $method payment for $uid");
+    public function __invoke(PayRequest $request): JsonResponse
+    {
+        try {
+            $result = $this->payments->handle($request->dto());
 
-        $payment = new PaymentModel();
-        $payment->user_id = $uid;
-        $payment->amount = $sum;
-        $payment->method = $method;
-        $payment->created_at = date('Y-m-d H:i:s');
+            return response()->json([
+                'success' => true,
+                'status' => $result->payment->status,
+                'message' => $result->message,
+                'amount' => $result->payment->amount,
+            ]);
+        } catch (Throwable $exception) {
+            report($exception);
 
-        if ($method === 'card') {
-            $processor->processCard($payment);
-        } elseif ($method === 'crypto') {
-            $processor->processCrypto($payment);
-        } else {
-            $logger::info("Unknown payment method: $method");
-            echo 'Unknown method';
+            return response()->json([
+                'success' => false,
+                'status' => 'error',
+                'message' => $exception->getMessage(),
+            ], 422);
         }
     }
 }
 
-class PaymentController {
-    public function pay(Request $request) {
-        $service = new PaymentService();
-        $service->handle($request->input('uid'), $request->input('sum'), $request->input('method'));
-    }
-}
+$this->app->bind(PaymentManager::class, function ($app) {
+    return new PaymentManager(
+        $app->make(PaymentRepository::class),
+        $app->make(Dispatcher::class),
+        $app->make(LoggerInterface::class),
+        [
+            $app->make(CardPaymentService::class),
+            $app->make(CryptoPaymentService::class),
+        ]
+    );
+});
+
 ?>
-
-
 
